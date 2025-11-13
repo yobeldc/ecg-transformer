@@ -1,0 +1,16 @@
+streamlit==1.37.0
+numpy>=1.24,<2.0
+pandas
+opencv-python-headless
+torch==2.3.1
+torchvision==0.18.1
+matplotlib
+
+
+# streamlit==1.37.0
+# numpy>=1.22
+# opencv-python
+# pandas
+# matplotlib
+# torch
+# torchvision
