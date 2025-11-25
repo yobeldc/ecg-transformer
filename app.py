@@ -3,11 +3,8 @@ ECG Drag-and-Drop Web App (Streamlit)
 -------------------------------------
 Run locally with:
   pip install -r requirements.txt
+  pip install streamlit-cropper pillow
   streamlit run app.py
-
-Notes:
-- Drop a PNG/JPG (and optional matching JSON) to see overlay visualisations + metrics.
-- Set your checkpoint paths in the left sidebar.
 """
 
 import os, json, math
@@ -19,6 +16,8 @@ import cv2
 import torch
 import torch.nn as nn
 import streamlit as st
+from PIL import Image
+from streamlit_cropper import st_cropper
 
 # ============================================================
 # Streamlit page config
@@ -26,8 +25,8 @@ import streamlit as st
 st.set_page_config(page_title="ECG Digitization — Drag & Drop", layout="wide")
 st.title("ECG Digitization (PNG/JPG → trace) — Drag & Drop")
 st.caption(
-    "Upload an ECG image (or photo), rotate if needed, then digitize "
-    "to get lead boxes, reconstructed traces, overlays, and metrics."
+    "Upload an ECG image (or photo), interactively crop to the ECG scan, "
+    "then digitize to get lead boxes, reconstructed traces, overlays, and metrics."
 )
 
 # ============================================================
@@ -99,6 +98,13 @@ with st.sidebar:
         "BBox img size", min_value=128, max_value=512, value=256, step=16
     )
 
+    # --- Lighting-normalization preprocessing toggle ---
+    APPLY_SCAN_PREPROC = st.checkbox(
+        "Normalize lighting (even exposure)",
+        value=True,
+        help="Make ECG lighting more uniform before inference.",
+    )
+
     st.markdown("---")
     st.caption(
         "Tip: Models are cached. Switching checkpoints or architecture "
@@ -106,7 +112,7 @@ with st.sidebar:
     )
 
 # ============================================================
-# Constants / colors
+# Constants / colors / size
 # ============================================================
 LEAD_NAMES = [
     "I",
@@ -127,42 +133,90 @@ GT_COLOR = (0, 255, 255)  # cyan (OpenCV BGR)
 PRED_COLOR = (255, 255, 0)  # yellow
 BOX_COLOR = (0, 255, 255)  # cyan
 
+# Target ECG image size expected by your model
+TRAIN_W, TRAIN_H = 2200, 1700
+
 # ============================================================
 # Helper functions
 # ============================================================
 
 
-def rotate_image_center(rgb: np.ndarray, angle_deg: float) -> np.ndarray:
+def letterbox_to_train_size(
+    img: np.ndarray,
+    new_w: int = TRAIN_W,
+    new_h: int = TRAIN_H,
+    color=(255, 255, 255),
+) -> np.ndarray:
     """
-    Rotate an RGB image by angle_deg degrees around its center,
-    expanding the canvas so nothing is cropped.
-    Positive angle = counter-clockwise.
+    Letterbox-resize an ECG image to exactly new_w x new_h.
+    Keeps aspect ratio; pads with 'color'.
     """
-    if abs(angle_deg) < 1e-3:
+    h, w = img.shape[:2]
+    if h == 0 or w == 0:
+        return np.full((new_h, new_w, 3), color, dtype=np.uint8)
+
+    scale = min(new_w / float(w), new_h / float(h))
+    rw, rh = int(round(w * scale)), int(round(h * scale))
+    resized = cv2.resize(img, (rw, rh), interpolation=cv2.INTER_AREA)
+
+    canvas = np.full((new_h, new_w, 3), color, dtype=np.uint8)
+    pad_x = (new_w - rw) // 2
+    pad_y = (new_h - rh) // 2
+    canvas[pad_y : pad_y + rh, pad_x : pad_x + rw] = resized
+    return canvas
+
+
+def simulate_scanner_style(rgb: np.ndarray) -> np.ndarray:
+    """
+    Strong lighting equalization by DARKENING bright regions
+    until illumination becomes visually uniform.
+    No brightening, no noise, no contrast sharpen.
+    """
+    if rgb is None or rgb.size == 0:
         return rgb
 
-    (h, w) = rgb.shape[:2]
-    center = (w / 2.0, h / 2.0)
+    # LAB space → control only brightness (L)
+    lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB)
+    L, a, b = cv2.split(lab)
+    Lf = L.astype(np.float32)
 
-    M = cv2.getRotationMatrix2D(center, angle_deg, 1.0)
+    # Estimate illumination pattern (slow blur)
+    bg = cv2.GaussianBlur(L, (0, 0), sigmaX=70, sigmaY=70).astype(np.float32)
 
-    cos = abs(M[0, 0])
-    sin = abs(M[0, 1])
-    new_w = int((h * sin) + (w * cos))
-    new_h = int((h * cos) + (w * sin))
+    # DARK baseline: make bright zones drop toward darker ones
+    dark_baseline = float(np.percentile(bg, 20))   # the 20% darkest region → target
 
-    M[0, 2] += (new_w / 2.0) - center[0]
-    M[1, 2] += (new_h / 2.0) - center[1]
+    # Compute darkening factor
+    # bg large (bright) → ratio small → strong darkening
+    # bg small (dark)  → ratio near 1 → almost no change
+    ratio = dark_baseline / (bg + 1e-6)
+    ratio = np.clip(ratio, 0.42, 1.00)  # stronger darkening range
 
-    rotated = cv2.warpAffine(
-        rgb,
-        M,
-        (new_w, new_h),
-        flags=cv2.INTER_LINEAR,
-        borderMode=cv2.BORDER_CONSTANT,
-        borderValue=(255, 255, 255),  # white background
-    )
-    return rotated
+    # Apply
+    L_dark = Lf * ratio
+    L_dark = np.clip(L_dark, 0, 255)
+
+    # Smooth artifacts — soft, non-sharpening, non-noisy
+    L_dark = cv2.GaussianBlur(L_dark.astype(np.uint8), (0, 0), sigmaX=1.1, sigmaY=1.1)
+
+    # Strong blending so the lighting result is VISIBLE to the eye
+    # (This is what previous versions lacked.)
+    blend = 0.80    # 80% equalized + 20% original → CLEAR change
+    L_final = cv2.addWeighted(L, 1 - blend, L_dark, blend, 0)
+
+    lab_out = cv2.merge((L_final.astype(np.uint8), a, b))
+    return cv2.cvtColor(lab_out, cv2.COLOR_LAB2RGB)
+
+
+def full_image_box(img: Image.Image, aspect_ratio=None):
+    """
+    Initial crop box = the whole image.
+
+    streamlit-cropper expects a dict:
+      {"left": int, "top": int, "width": int, "height": int}
+    """
+    w, h = img.size
+    return {"left": 0, "top": 0, "width": w, "height": h}
 
 
 def _letterbox_256(rgb: np.ndarray, dst: int = 256):
@@ -190,7 +244,7 @@ def _map_back(norm_box, scale, px, py, W0, H0, dst=256):
 
 
 def expand_box_to_spikes_enlarge_only(
-    rgb, box_xyxy, pad_px=8, max_expand=32, grad_pct=90, hpad_px=4
+    rgb, box_xyxy, pad_px=8, max_expand=64, grad_pct=90, hpad_px=4
 ):
     H, W = rgb.shape[:2]
     x1, y1, x2, y2 = map(int, box_xyxy)
@@ -485,10 +539,7 @@ class ColumnSignalTransformerDyT(nn.Module):
 
 # ---- TCN-style ColumnSignalCNN ----
 class _TCNBlock(nn.Module):
-    """
-    Residual 1D conv block over the width dimension with dilation.
-    Uses depthwise-separable convs to keep params reasonable.
-    """
+    """Residual 1D conv block over the width dimension with dilation."""
 
     def __init__(self, ch, kernel=7, dilation=1, dropout=0.0):
         super().__init__()
@@ -514,7 +565,6 @@ class _TCNBlock(nn.Module):
 class ColumnSignalCNN(nn.Module):
     """
     Map per-column image (H_REF) across width W using a TCN stack.
-    Interface matches ColumnSignalTransformer / ColumnSignalTransformerDyT.
     - X: [B, H_ref, W]
     - attn_mask (optional): [B, W] (1=valid, 0=pad)
     - returns y_norm: [B, W] in [-1, 1]
@@ -568,13 +618,10 @@ def _get_device():
 
 def _detect_arch_from_state(sd: Dict[str, torch.Tensor]) -> str | None:
     keys = list(sd.keys())
-    # TCN: depthwise convs
     if any(".dw.weight" in k for k in keys):
         return "tcn"
-    # DyT: custom layers.*.attn
     if any("layers.0.attn.in_proj_weight" in k for k in keys):
         return "dyt"
-    # Vanilla: encoder.layers.0.self_attn
     if any("encoder.layers.0.self_attn.in_proj_weight" in k for k in keys):
         return "vanilla"
     return None
@@ -655,7 +702,16 @@ def _unnorm_to_pixels(y_norm: torch.Tensor, Hc: torch.Tensor) -> torch.Tensor:
     return y
 
 
-def run_inference(rgb: np.ndarray, json_ann: Dict[str, Any] | None, cfg: Dict[str, Any]):
+def run_inference(
+    rgb: np.ndarray,
+    json_ann: Dict[str, Any] | None,
+    cfg: Dict[str, Any],
+    overlay_base: np.ndarray | None = None,
+):
+    """
+    rgb          : image used by the models (possibly lighting-normalized)
+    overlay_base : original-looking image (same size) used just for drawing overlays
+    """
     device, bbox_head, signal_model, _ = load_models_cached(
         cfg["bbox_ckpt"],
         cfg["sig_ckpt"],
@@ -735,7 +791,8 @@ def run_inference(rgb: np.ndarray, json_ann: Dict[str, Any] | None, cfg: Dict[st
     m_np = mask.detach().cpu().numpy()
 
     # ---- Prediction-only overlay ----
-    canvas = rgb.copy()
+    base_for_overlay = overlay_base if overlay_base is not None else rgb
+    canvas = base_for_overlay.copy()
     for i, meta in enumerate(metas):
         x1, y1, x2, y2 = meta["exp_box"]
         w = int(m_np[i].sum())
@@ -844,7 +901,7 @@ def run_inference(rgb: np.ndarray, json_ann: Dict[str, Any] | None, cfg: Dict[st
             return pcc, rmse, snr
 
         rows = []
-        canvas_pg = rgb.copy()
+        canvas_pg = base_for_overlay.copy()
         for i, meta in enumerate(metas):
             lead = meta["lead"]
             x1, y1, x2, y2 = meta["exp_box"]
@@ -940,7 +997,7 @@ def run_inference(rgb: np.ndarray, json_ann: Dict[str, Any] | None, cfg: Dict[st
 
 
 # ============================================================
-# UI — upload, manual rotation, results
+# UI — upload, interactive crop, letterbox, results
 # ============================================================
 left, right = st.columns([1, 1])
 
@@ -957,41 +1014,51 @@ with left:
 with right:
     st.info(
         "1. Upload or take a photo of the ECG.\n"
-        "2. Adjust **Manual rotation** so the grid lines are horizontal.\n"
-        "3. Click **Run Inference**."
+        "2. By default the crop box covers the whole image (no crop).\n"
+        "   You can drag each side to trim the white margins.\n"
+        "3. The cropped ECG will be resized to 2200×1700 internally.\n"
+        "4. Click **Run Inference**."
     )
 
-rot_rgb = None
-raw_rgb = None
+cropped_rgb = None
 
 if up_png is not None:
-    img_bytes = up_png.getvalue()
-    file_bytes = np.asarray(bytearray(img_bytes), dtype=np.uint8)
-    bgr = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+    # Read uploaded file as PIL for st_cropper
+    pil_img = Image.open(up_png).convert("RGB")
 
-    if bgr is None:
-        st.error("Failed to read image. Make sure it's a valid PNG/JPG.")
-    else:
-        raw_rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    st.subheader("Interactive crop")
+    st.caption(
+        "The green box initially covers the whole image. "
+        "Drag the edges so that only the ECG scan (pink grid) is inside."
+    )
 
-        st.subheader("Manual rotation")
-        angle = st.slider(
-            "Rotate image (degrees, +CCW)",
-            min_value=-30,
-            max_value=30,
-            value=0,
-            step=1,
-            help="If the photo is tilted, rotate until the ECG grid looks horizontal.",
-        )
+    aspect_choice = st.radio(
+        "Crop aspect ratio",
+        options=["Free", "Match training (2200×1700)"],
+        index=0,
+        horizontal=True,
+    )
+    aspect_ratio = None if aspect_choice == "Free" else (TRAIN_W, TRAIN_H)
 
-        rot_rgb = rotate_image_center(raw_rgb, angle) if abs(angle) > 0 else raw_rgb
-        st.image(rot_rgb, channels="RGB", caption="Input used for inference")
+    realtime_update = st.checkbox("Realtime crop update", value=True)
+    box_color = st.color_picker("Crop box color", "#00FF00")
 
-run_btn = st.button("Run Inference", type="primary", use_container_width=True)
+    cropped_pil = st_cropper(
+        pil_img,
+        realtime_update=realtime_update,
+        box_color=box_color,
+        aspect_ratio=aspect_ratio,
+        box_algorithm=full_image_box,  # default box = full image
+    )
+
+    st.image(cropped_pil, caption="Cropped ECG region (will be used for inference)")
+    cropped_rgb = np.array(cropped_pil, dtype=np.uint8)
+
+run_btn = st.button("Run Inference", type="primary")
 
 if run_btn:
-    if rot_rgb is None:
-        st.warning("Please upload an ECG image first.")
+    if cropped_rgb is None:
+        st.warning("Please upload an ECG image and adjust the crop first.")
         st.stop()
 
     ann = None
@@ -1000,6 +1067,16 @@ if run_btn:
             ann = json.loads(up_json.getvalue().decode("utf-8"))
         except Exception as e:
             st.warning(f"JSON could not be parsed: {e}")
+
+    # Letterbox *cropped* ECG to 2200×1700 before inference
+    resized_rgb = letterbox_to_train_size(cropped_rgb, new_w=TRAIN_W, new_h=TRAIN_H)
+    original_for_overlay = resized_rgb.copy()
+
+    # Apply lighting-normalization preprocessing (if enabled) for the model only
+    if APPLY_SCAN_PREPROC:
+        image_for_model = simulate_scanner_style(resized_rgb)
+    else:
+        image_for_model = resized_rgb
 
     cfg = dict(
         bbox_ckpt=BBOX_CKPT,
@@ -1013,7 +1090,12 @@ if run_btn:
 
     with st.spinner("Running model…"):
         try:
-            out = run_inference(rot_rgb, ann, cfg)
+            out = run_inference(
+                image_for_model,
+                ann,
+                cfg,
+                overlay_base=original_for_overlay,
+            )
         except Exception as e:
             st.exception(e)
             st.stop()
@@ -1064,7 +1146,7 @@ if run_btn:
         if out["metrics"] is None:
             st.info("Metrics available only if JSON was provided.")
         else:
-            st.dataframe(out["metrics"], use_container_width=True)
+            st.dataframe(out["metrics"])
             csv_bytes = (
                 out["metrics"].reset_index().to_csv(index=False).encode("utf-8")
             )
